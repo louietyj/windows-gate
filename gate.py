@@ -2,23 +2,23 @@
 # requires-python = ">=3.11"
 # dependencies = ["aiohttp>=3.9", "pystray>=0.19", "pillow>=10"]
 # ///
-"""Approval gate in front of windows-mcp, for use as a claude.ai custom connector.
+"""Approval gate between cloud Claude and this laptop, with one backend per thing it guards.
 
-    claude.ai --Bearer--> cloudflared --> gate (127.0.0.1:9340) --> windows-mcp (loopback, own key)
+    claude.ai --> cloudflared --> mcp-windows.louietyj.me --> :9340  --> windows-mcp       (mcp_windows.py)
+                              --> browser.louietyj.me     --> :19870 --> pinchtab bridge   (pinchtab_windows.py)
 
-claude.ai's MCP client is stateless (no initialize, no Mcp-Session-Id), so the
-gate makes its own per-conversation binding: an injected RequestGrant tool pops
-a Windows dialog with the model's stated purpose, and on Allow returns a grant
-ID that every other tool requires as `_grant`. Calls without a live grant fail
-at once without prompting. Grants live only in memory and lapse after 15 min
-idle or 1 h total; the tray icon lists them and revokes them.
+A backend's own credential (the connector bearer, the browser gate key) only lets
+a caller ask. Doing anything needs a grant, and only Louie's click in the approval
+dialog creates one. Grants live only in memory, are scoped to their backend and
+lapse when idle or at a cap; the tray icon and its window list and revoke them.
 
-The gate also supervises its children: windows-mcp (on a random loopback port
-with a per-run key) and, if --tunnel is given, `cloudflared tunnel run`. Both
-sit in a kill-on-close job object, so they die with the gate.
+The gate supervises its children (windows-mcp, the pinchtab bridge, and with
+--tunnel `cloudflared tunnel run`) in a kill-on-close job object, so they die
+with it.
 """
 import argparse
 import asyncio
+import collections
 import ctypes
 import ctypes.wintypes as wt
 import dataclasses
@@ -29,59 +29,22 @@ import logging
 import os
 import pathlib
 import queue
-import re
 import secrets
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, ttk
 
-import aiohttp
 import pystray
-from aiohttp import web
 from PIL import Image, ImageDraw
 
 DATA = pathlib.Path(os.environ["LOCALAPPDATA"]) / "mcp-windows-gate"
 DATA.mkdir(parents=True, exist_ok=True)
 AUDIT = DATA / "audit.jsonl"
-BEARER_FILE = DATA / "bearer.txt"
-
-REQUEST_TOOL = "RequestGrant"
-RELEASE_TOOL = "ReleaseGrant"
-GRANT_PROP = {
-    "type": "string",
-    "description": (
-        "Required. The grant ID that RequestGrant returned in this conversation. "
-        "Call RequestGrant first if you have none or it has lapsed."
-    ),
-}
-REQUEST_DEF = {
-    "name": REQUEST_TOOL,
-    "title": "Request grant",
-    "description": (
-        "Call this before using any other tool on this server. It asks Louie to approve "
-        "on his laptop and returns a grant ID that every other tool requires as `_grant`. "
-        "One grant covers the whole task: reuse it until a call says it has lapsed "
-        "(15 min without a call, or 1 h total)."
-    ),
-    "inputSchema": {
-        "type": "object",
-        "properties": {"purpose": {
-            "type": "string",
-            "description": "One line on what you're about to do on Louie's computer. It's shown in his approval dialog.",
-        }},
-        "required": ["purpose"],
-    },
-}
-RELEASE_DEF = {
-    "name": RELEASE_TOOL,
-    "title": "Release grant",
-    "description": "End this conversation's grant once the task is done, so it can't be used again.",
-    "inputSchema": {"type": "object", "properties": {"_grant": GRANT_PROP}, "required": ["_grant"]},
-}
 
 log = logging.getLogger("gate")
 
@@ -91,9 +54,15 @@ log = logging.getLogger("gate")
 @dataclasses.dataclass
 class Grant:
     id: str
+    backend: str
+    purpose: str
+    origin: str  # the caller's IP, or the agent name it gave
+    idle: int
+    cap: int
     created: float
     last_used: float
-    purpose: str
+    code: str = ""
+    calls: int = 0
 
     @property
     def short(self):
@@ -101,8 +70,7 @@ class Grant:
 
 
 class Grants:
-    def __init__(self, idle, cap):
-        self.idle, self.cap = idle, cap
+    def __init__(self):
         self.lock = threading.Lock()
         self.live: dict[str, Grant] = {}
         self.paused = False
@@ -116,71 +84,106 @@ class Grants:
             log.exception("tray refresh failed")
 
     def _expiry(self, g, now):
-        if now - g.created > self.cap:
-            return f"grant {g.short} hit its {self.cap // 60} min cap"
-        if now - g.last_used > self.idle:
-            return f"grant {g.short} lapsed after {self.idle // 60} min idle"
+        if now - g.created > g.cap:
+            return f"grant {g.short} hit its {g.cap // 60} min cap"
+        if now - g.last_used > g.idle:
+            return f"grant {g.short} lapsed after {g.idle // 60} min idle"
         return None
 
-    def use(self, gid):
-        """Return (grant, None) if gid is live, else (None, reason)."""
+    def use(self, gid, backend):
+        """Return (grant, None) if gid is live for backend, else (None, reason)."""
         if not gid:
             return None, "no grant"
+        if self.paused:
+            return None, "Louie has paused the gate"
         now = time.time()
         with self.lock:
             g = next((g for k, g in self.live.items() if hmac.compare_digest(k, gid)), None)
-            if g is None:
+            if g is None or g.backend != backend:
                 return None, "unknown or revoked grant"
             why = self._expiry(g, now)
             if why:
                 del self.live[g.id]
             else:
                 g.last_used = now
+                g.calls += 1
         if why:
+            audit(backend=g.backend, event="grant_expired", purpose=g.purpose, why=why)
             self._changed()
             return None, why
         return g, None
 
-    def create(self, purpose):
+    def create(self, backend, purpose, origin, idle, cap, code=""):
         now = time.time()
-        g = Grant("g_" + secrets.token_urlsafe(18), now, now, purpose)
+        g = Grant("g_" + secrets.token_urlsafe(18), backend, purpose, origin, idle, cap, now, now, code)
         with self.lock:
             self.live[g.id] = g
         self._changed()
         return g
 
-    def revoke(self, gid=None):
+    def revoke(self, gid=None, backend=None, why="revoked"):
+        """Revoke one grant, a backend's, or (no arguments) every one."""
         with self.lock:
-            if gid is None:
-                n = len(self.live)
-                self.live.clear()
-            else:
-                n = 1 if self.live.pop(gid, None) else 0
+            doomed = [g for k, g in self.live.items()
+                      if (gid is None or k == gid) and (backend is None or g.backend == backend)]
+            for g in doomed:
+                del self.live[g.id]
+        for g in doomed:
+            audit(backend=g.backend, event="grant_" + why, purpose=g.purpose)
         self._changed()
-        return n
+        return len(doomed)
 
     def sweep(self):
         now = time.time()
         with self.lock:
-            dead = [k for k, g in self.live.items() if self._expiry(g, now)]
-            for k in dead:
-                del self.live[k]
+            dead = [(g, self._expiry(g, now)) for g in self.live.values() if self._expiry(g, now)]
+            for g, _ in dead:
+                del self.live[g.id]
+        for g, why in dead:
+            audit(backend=g.backend, event="grant_expired", purpose=g.purpose, why=why)
         if dead:
             self._changed()
 
-    def snapshot(self):
+    def snapshot(self, backend=None):
         with self.lock:
-            return sorted(self.live.values(), key=lambda g: g.created)
+            gs = [dataclasses.replace(g) for g in self.live.values() if backend is None or g.backend == backend]
+        return sorted(gs, key=lambda g: g.created)
 
 
 def fingerprint(gid):
     return hashlib.sha256(gid.encode()).hexdigest()[:8] if gid else None
 
 
+# The window's activity list; audit.jsonl keeps everything.
+RECENT: collections.deque = collections.deque(maxlen=300)
+
+
 def audit(**rec):
     rec = {"t": time.strftime("%Y-%m-%d %H:%M:%S"), **rec}
+    RECENT.appendleft(rec)
     with AUDIT.open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec) + "\n")
+
+
+def ago(t):
+    m = int((time.time() - t) // 60)
+    return f"{m} min" if m else "<1 min"
+
+
+def activity_row(rec, core):
+    detail = rec.get("tool") or " ".join(x for x in (rec.get("method"), rec.get("path")) if x) or rec.get("purpose") or ""
+    if rec.get("args"):
+        detail += "  " + rec["args"]
+    result = rec.get("decision") or rec.get("status") or rec.get("error") or rec.get("why") or ""
+    return rec.get("t", ""), core.label(rec.get("backend", "")), rec.get("event", ""), detail[:300], str(result)
+
+
+def load_secret(name):
+    """A per-backend credential, generated once and kept in DATA."""
+    path = DATA / name
+    if not path.exists():
+        path.write_text(secrets.token_urlsafe(32), encoding="ascii")
+    return path.read_text(encoding="ascii").strip()
 
 
 # --------------------------------------------------------------------------- children
@@ -281,232 +284,15 @@ async def supervise(name, argv, job):
         await asyncio.sleep(3)
 
 
-# --------------------------------------------------------------------------- MCP plumbing
-
-@dataclasses.dataclass
-class Upstream:
-    status: int
-    ctype: str
-    body: bytes
-    session: str | None = None
-
-
-def map_messages(up, fn):
-    """Apply fn to each JSON-RPC message in a JSON or buffered-SSE response body."""
-    if up.ctype.startswith("application/json"):
-        try:
-            msg = json.loads(up.body)
-        except ValueError:
-            return up
-        msgs = [fn(m) for m in msg] if isinstance(msg, list) else fn(msg)
-        return dataclasses.replace(up, body=json.dumps(msgs).encode())
-    if up.ctype.startswith("text/event-stream"):
-        out = []
-        for event in re.split(r"\r?\n\r?\n", up.body.decode("utf-8")):
-            if not event.strip():
-                continue
-            lines = event.splitlines()
-            data = "\n".join(l[5:].lstrip(" ") for l in lines if l.startswith("data:"))
-            try:
-                msg = json.loads(data)
-            except ValueError:
-                out.append(event)
-                continue
-            rest = [l for l in lines if not l.startswith("data:")]
-            out.append("\n".join(rest + ["data: " + json.dumps(fn(msg))]))
-        return dataclasses.replace(up, body=("\n\n".join(out) + "\n\n").encode())
-    return up
-
-
-def patch_tools_list(msg):
-    tools = (msg.get("result") or {}).get("tools")
-    if isinstance(tools, list):
-        for t in tools:
-            schema = t.setdefault("inputSchema", {"type": "object"})
-            schema.setdefault("properties", {})["_grant"] = GRANT_PROP
-            required = schema.setdefault("required", [])
-            if "_grant" not in required:
-                required.append("_grant")
-        tools[:0] = [REQUEST_DEF]
-        tools.append(RELEASE_DEF)
-    return msg
-
-
-def rpc_result(rpc_id, text, is_error=False):
-    # Protocol 2026-07-28 requires resultType; windows-mcp's own results carry "complete".
-    return web.json_response({
-        "jsonrpc": "2.0", "id": rpc_id,
-        "result": {"content": [{"type": "text", "text": text}], "isError": is_error, "resultType": "complete"},
-    })
-
-
-GRANTED = (
-    "Louie approved. Grant: {gid}\n"
-    "Pass \"_grant\": \"{gid}\" in the arguments of every call to this server's tools for "
-    "the rest of this task. It lapses after {idle} min without a call or {cap} min total. "
-    "Call ReleaseGrant with it when the task is done."
-)
-NO_GRANT = (
-    "No valid grant ({why}), so this call did not run. Call RequestGrant with a one-line "
-    "purpose, then retry with the grant ID it returns as \"_grant\"."
-)
-DENIED = "Louie denied the grant on his laptop. Do not ask again unless he tells you to."
-PAUSED = "The mcp-windows gate is paused on Louie's laptop: every call is refused until he unpauses it."
-TIMED_OUT = (
-    "Approval timed out: Louie didn't answer the prompt on his laptop within {hold} s, so he "
-    "may be away from it. Tell him, and retry only when he says he's there."
-)
-
-
-class Gate:
-    def __init__(self, args, grants, ui):
-        self.args, self.grants, self.ui = args, grants, ui
-        self.bearer = load_bearer()
-        self.inner_key = secrets.token_urlsafe(32)
-        self.inner_port = free_port()
-        self.http: aiohttp.ClientSession | None = None
-
-    @property
-    def upstream_url(self):
-        return f"http://127.0.0.1:{self.inner_port}/mcp"
-
-    async def forward(self, request, body):
-        headers = {k: v for k, v in request.headers.items() if k.lower() in (
-            "content-type", "accept", "mcp-protocol-version", "mcp-method", "mcp-name",
-            "mcp-session-id", "last-event-id")}
-        headers["Authorization"] = f"Bearer {self.inner_key}"
-        try:
-            async with self.http.post(self.upstream_url, data=body, headers=headers) as r:
-                return Upstream(r.status, r.headers.get("Content-Type", "application/json"),
-                                await r.read(), r.headers.get("Mcp-Session-Id"))
-        except aiohttp.ClientError as e:
-            log.error("upstream: %s", e)
-            return None
-
-    @staticmethod
-    def respond(up):
-        headers = {"Content-Type": up.ctype}
-        if up.session:
-            headers["Mcp-Session-Id"] = up.session
-        return web.Response(status=up.status, body=up.body, headers=headers)
-
-    async def handle(self, request):
-        ip = request.headers.get("Cf-Connecting-Ip") or request.remote
-        auth = request.headers.get("Authorization", "")
-        if not (auth.startswith("Bearer ") and hmac.compare_digest(auth[7:].strip(), self.bearer)):
-            audit(event="auth_fail", ip=ip, path=request.path)
-            return web.Response(status=401, headers={"WWW-Authenticate": 'Bearer realm="mcp-windows-gate"'})
-        if request.method != "POST":
-            return web.Response(status=405)
-
-        body = await request.read()
-        try:
-            msg = json.loads(body)
-        except ValueError:
-            msg = None
-        if isinstance(msg, list) and any(isinstance(m, dict) and m.get("method") == "tools/call" for m in msg):
-            return web.json_response({"jsonrpc": "2.0", "id": None,
-                                      "error": {"code": -32600, "message": "batched tools/call is not supported"}})
-        if isinstance(msg, dict) and msg.get("method") == "tools/call":
-            return await self.handle_call(request, msg, ip)
-
-        up = await self.forward(request, body)
-        if up is None:
-            return web.Response(status=502, text="windows-mcp is not reachable")
-        if isinstance(msg, dict) and msg.get("method") == "tools/list":
-            up = map_messages(up, patch_tools_list)
-        return self.respond(up)
-
-    async def handle_call(self, request, msg, ip):
-        rpc_id = msg.get("id")
-        params = dict(msg.get("params") or {})
-        tool = params.get("name")
-        args = dict(params.get("arguments") or {})
-        gid = args.pop("_grant", None)
-        rec = {"event": "call", "ip": ip, "tool": tool, "args": json.dumps(args)[:300], "grant": fingerprint(gid)}
-
-        if tool == RELEASE_TOOL:
-            n = self.grants.revoke(gid) if gid else 0
-            audit(**rec, decision="released" if n else "release_unknown")
-            return rpc_result(rpc_id, "Grant released." if n else "That grant was already gone.")
-
-        if tool == REQUEST_TOOL:
-            return await self.request_grant(rpc_id, args.get("purpose") or "(no purpose given)", ip, rec)
-
-        grant, why = self.grants.use(gid)
-        if grant is None:
-            audit(**rec, decision="no_grant", why=why)
-            return rpc_result(rpc_id, NO_GRANT.format(why=why), is_error=True)
-
-        params["arguments"] = args
-        up = await self.forward(request, json.dumps({**msg, "params": params}).encode())
-        if up is None:
-            audit(**rec, error="upstream unreachable")
-            return rpc_result(rpc_id, "windows-mcp is not reachable on Louie's laptop.", is_error=True)
-        audit(**rec, decision="granted", status=up.status)
-        return self.respond(up)
-
-    async def request_grant(self, rpc_id, purpose, ip, rec):
-        if self.grants.paused:
-            audit(**rec, decision="paused")
-            return rpc_result(rpc_id, PAUSED, is_error=True)
-        t0 = time.monotonic()
-        ok = await self.ui.ask(purpose, ip, self.args.hold)
-        rec["waited_s"] = round(time.monotonic() - t0, 1)
-        if ok is None:
-            audit(**rec, decision="timeout")
-            return rpc_result(rpc_id, TIMED_OUT.format(hold=self.args.hold), is_error=True)
-        if not ok:
-            audit(**rec, decision="denied")
-            return rpc_result(rpc_id, DENIED, is_error=True)
-        g = self.grants.create(purpose)
-        audit(**rec, decision="approved", new_grant=fingerprint(g.id))
-        return rpc_result(rpc_id, GRANTED.format(gid=g.id, idle=self.args.idle // 60, cap=self.args.cap // 60))
-
-    async def run(self, job, stop):
-        self.http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, sock_connect=5))
-        app = web.Application(client_max_size=64 * 1024 * 1024)
-        app.router.add_route("*", "/mcp", self.handle)
-        runner = web.AppRunner(app, access_log=None)
-        await runner.setup()
-        await web.TCPSite(runner, "127.0.0.1", self.args.port).start()
-        log.info("gate on 127.0.0.1:%s -> windows-mcp on :%s", self.args.port, self.inner_port)
-
-        uvx = shutil.which("uvx") or "uvx"
-        tasks = [asyncio.ensure_future(supervise("windows-mcp", [
-            uvx, "windows-mcp", "serve", "--transport", "streamable-http", "--host", "127.0.0.1",
-            "--port", str(self.inner_port), "--auth-key", self.inner_key], job))]
-        if self.args.tunnel:
-            cf = shutil.which("cloudflared") or "cloudflared"
-            tasks.append(asyncio.ensure_future(supervise("cloudflared", [
-                cf, "tunnel", "--no-autoupdate", "run", "--url", f"http://127.0.0.1:{self.args.port}",
-                self.args.tunnel], job)))
-
-        async def sweeper():
-            while True:
-                await asyncio.sleep(20)
-                self.grants.sweep()
-        tasks.append(asyncio.ensure_future(sweeper()))
-
-        await stop.wait()
-        for t in tasks:
-            t.cancel()
-        await self.http.close()
-        await runner.cleanup()
-
-
-def load_bearer():
-    if not BEARER_FILE.exists():
-        BEARER_FILE.write_text(secrets.token_urlsafe(32), encoding="ascii")
-    return BEARER_FILE.read_text(encoding="ascii").strip()
-
-
 # --------------------------------------------------------------------------- UI
 
 @dataclasses.dataclass
 class DialogReq:
+    heading: str
     purpose: str
-    ip: str
+    origin: str
+    note: str
+    code: str
     hold: int
     loop: asyncio.AbstractEventLoop
     fut: asyncio.Future
@@ -521,6 +307,7 @@ class UI:
         self.root.withdraw()
         self.q: queue.Queue = queue.Queue()
         self.root.after(100, self._pump)
+        self.window = None
 
     def post(self, *cmd):
         self.q.put(cmd)
@@ -534,9 +321,10 @@ class UI:
             pass
         self.root.after(100, self._pump)
 
-    async def ask(self, purpose, ip, hold):
+    async def ask(self, heading, purpose, origin, note, hold, code=""):
+        """True (allowed), False (denied) or None (unanswered within hold seconds)."""
         loop = asyncio.get_running_loop()
-        req = DialogReq(purpose, ip, hold, loop, loop.create_future())
+        req = DialogReq(heading, purpose, origin, note, code, hold, loop, loop.create_future())
         self.post("dialog", req)
         try:
             return await asyncio.wait_for(asyncio.shield(req.fut), hold)
@@ -561,31 +349,34 @@ class UI:
     def _do_dialog(self, req):
         w = tk.Toplevel(self.root)
         req.win = w
-        w.title("mcp-windows: grant access?")
+        w.title("Gate: grant access?")
         w.attributes("-topmost", True)
         w.resizable(False, False)
         w.protocol("WM_DELETE_WINDOW", lambda: self._decide(req, False))
         w.bind("<Escape>", lambda e: self._decide(req, False))
 
         pad = {"padx": 14, "pady": (10, 0), "anchor": "w"}
-        tk.Label(w, text="Claude wants control of this PC", font=("Segoe UI", 13, "bold")).pack(**pad)
-        tk.Label(w, text=f"from {req.ip} at {time.strftime('%H:%M:%S')}",
+        tk.Label(w, text=req.heading, font=("Segoe UI", 13, "bold")).pack(**pad)
+        tk.Label(w, text=f"from {req.origin} at {time.strftime('%H:%M:%S')}",
                  font=("Segoe UI", 9), fg="#555").pack(padx=14, anchor="w")
         txt = tk.Text(w, width=72, height=min(8, 2 + len(req.purpose) // 70),
                       font=("Segoe UI", 10), wrap="word", relief="solid", borderwidth=1)
         txt.insert("1.0", req.purpose[:2000])
         txt.configure(state="disabled")
         txt.pack(padx=14, pady=8, fill="x")
-        tk.Label(w, text="Allow opens a grant for that conversation: every windows-mcp tool, "
-                         "including PowerShell, for 15 min idle or 1 h max. "
-                         "Only allow a request you just made.",
-                 font=("Segoe UI", 9), wraplength=520, justify="left").pack(padx=14, anchor="w")
+        if req.code:
+            tk.Label(w, text=f"Code  {req.code}", font=("Consolas", 18, "bold")).pack(padx=14, anchor="w")
+            tk.Label(w, text="It must match the code Claude wrote in the chat.",
+                     font=("Segoe UI", 9), fg="#555").pack(padx=14, anchor="w")
+        tk.Label(w, text=req.note + " Only allow a request you just made.",
+                 font=("Segoe UI", 9), wraplength=520, justify="left").pack(padx=14, pady=(8, 0), anchor="w")
 
         row = tk.Frame(w)
         row.pack(fill="x", padx=14, pady=12)
         left = tk.Label(row, font=("Segoe UI", 9), fg="#555")
         left.pack(side="left")
-        tk.Button(row, text="Deny", width=10, command=lambda: self._decide(req, False)).pack(side="right")
+        deny = tk.Button(row, text="Deny", width=10, command=lambda: self._decide(req, False))
+        deny.pack(side="right")
         tk.Button(row, text="Allow", width=10, command=lambda: self._decide(req, True)).pack(side="right", padx=8)
 
         deadline = time.monotonic() + req.hold
@@ -606,11 +397,103 @@ class UI:
         w.geometry(f"+{x}+{y}")
         w.lift()
         w.focus_force()
+        # Space activates the focused button: a keystroke meant for another window
+        # as this one grabs focus must deny, never allow.
+        deny.focus_set()
         w.bell()
 
     def _do_copy(self, text):
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
+
+    def _do_window(self, core):
+        """The status window: what has access, what it did, and buttons to stop it."""
+        if self.window is not None and self.window.winfo_exists():
+            self.window.deiconify()
+            self.window.lift()
+            self.window.focus_force()
+            return
+        w = self.window = tk.Toplevel(self.root)
+        w.title("Gate")
+        w.geometry("1000x620")
+        w.minsize(760, 440)
+        pad = {"padx": 12, "anchor": "w"}
+
+        header = tk.Label(w, font=("Segoe UI", 12, "bold"))
+        header.pack(pady=(10, 2), **pad)
+        status_rows = []
+        for b in core.backends:
+            row = tk.Frame(w)
+            row.pack(fill="x", padx=12, pady=1)
+            label = tk.Label(row, font=("Segoe UI", 9), anchor="w")
+            label.pack(side="left")
+            buttons = []
+            for text, action, enabled in b.actions():
+                btn = ttk.Button(row, text=text, command=action)
+                btn.pack(side="right", padx=2)
+                buttons.append((btn, enabled))
+            status_rows.append((b, label, buttons))
+
+        tk.Label(w, text="Live grants", font=("Segoe UI", 10, "bold")).pack(pady=(10, 2), **pad)
+        cols = {"backend": 90, "origin": 120, "code": 55, "purpose": 420, "age": 70, "idle": 70, "calls": 55}
+        grants_tv = ttk.Treeview(w, columns=list(cols), show="headings", height=6)
+        for c, width in cols.items():
+            grants_tv.heading(c, text=c.capitalize())
+            grants_tv.column(c, width=width, stretch=c == "purpose")
+        grants_tv.pack(fill="x", padx=12)
+
+        row = tk.Frame(w)
+        row.pack(fill="x", padx=12, pady=6)
+        ttk.Button(row, text="Revoke selected",
+                   command=lambda: [core.grants.revoke(gid) for gid in grants_tv.selection()]).pack(side="left")
+        ttk.Button(row, text="Revoke all", command=lambda: core.grants.revoke()).pack(side="left", padx=6)
+        paused = tk.BooleanVar(value=core.grants.paused)
+        ttk.Checkbutton(row, text="Pause: refuse every request and call", variable=paused,
+                        command=lambda: core.set_paused(paused.get())).pack(side="left", padx=12)
+
+        tk.Label(w, text="Activity", font=("Segoe UI", 10, "bold")).pack(pady=(8, 2), **pad)
+        acols = {"time": 140, "backend": 90, "event": 110, "detail": 520, "result": 110}
+        act_tv = ttk.Treeview(w, columns=list(acols), show="headings")
+        for c, width in acols.items():
+            act_tv.heading(c, text=c.capitalize())
+            act_tv.column(c, width=width, stretch=c == "detail")
+        act_tv.pack(fill="both", expand=True, padx=12)
+
+        foot = tk.Frame(w)
+        foot.pack(fill="x", padx=12, pady=8)
+        for b in core.backends:
+            for text, value in b.copies():
+                ttk.Button(foot, text=text, command=lambda v=value: self._do_copy(v)).pack(side="left", padx=(0, 6))
+        ttk.Button(foot, text="Open data folder", command=lambda: os.startfile(DATA)).pack(side="right")
+        ttk.Button(foot, text="Open audit log", command=lambda: os.startfile(AUDIT)).pack(side="right", padx=6)
+
+        shown = {"activity": None}
+
+        def refresh():
+            if not w.winfo_exists():
+                return
+            gs = core.grants.snapshot()
+            header.configure(text="Paused: every request and call is refused" if core.grants.paused
+                             else f"{len(gs)} live grant(s)", fg="#c0392b" if core.grants.paused else "black")
+            paused.set(core.grants.paused)
+            for b, label, buttons in status_rows:
+                label.configure(text=f"{b.label}: {b.status()}")
+                for btn, enabled in buttons:
+                    btn.state(["!disabled"] if enabled() else ["disabled"])
+            selected = set(grants_tv.selection())
+            grants_tv.delete(*grants_tv.get_children())
+            for g in gs:
+                grants_tv.insert("", "end", iid=g.id, values=(
+                    core.label(g.backend), g.origin, g.code, g.purpose, ago(g.created), ago(g.last_used), g.calls))
+            grants_tv.selection_set([g.id for g in gs if g.id in selected])
+            head = RECENT[0] if RECENT else None
+            if head is not shown["activity"]:
+                shown["activity"] = head
+                act_tv.delete(*act_tv.get_children())
+                for rec in list(RECENT)[:150]:
+                    act_tv.insert("", "end", values=activity_row(rec, core))
+            w.after(1500, refresh)
+        refresh()
 
     def _do_quit(self):
         self.root.quit()
@@ -620,64 +503,145 @@ def tray_image(color):
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     d.rounded_rectangle((4, 4, 60, 60), radius=12, fill=color)
-    d.text((22, 16), "W", fill="white", font_size=30)
+    d.text((22, 16), "G", fill="white", font_size=30)
     return img
 
 
 IDLE, LIVE, PAUSED_C = "#7a7a7a", "#2e9d4f", "#c0392b"
 
 
-def build_tray(grants, ui, gate, on_quit):
-    def ago(t):
-        m = int((time.time() - t) // 60)
-        return f"{m} min" if m else "<1 min"
+def build_tray(core, on_quit):
+    grants, ui = core.grants, core.ui
 
+    # pystray passes (icon, item) to as many parameters as an action has, defaults
+    # included, so values are bound with factories, never `v=value` defaults.
     def revoker(gid):
-        # pystray rejects actions with more than two parameters, so no gid=g.id default.
         return lambda: grants.revoke(gid)
+
+    def copier(value):
+        return lambda: ui.post("copy", value)
 
     def items():
         gs = grants.snapshot()
-        yield pystray.MenuItem(f"{len(gs)} live grant(s)", None, enabled=False)
+        yield pystray.MenuItem("Open window", lambda: ui.post("window", core), default=True)
+        yield pystray.Menu.SEPARATOR
+        yield pystray.MenuItem("Paused: every request is refused" if grants.paused
+                               else f"{len(gs)} live grant(s)", None, enabled=False)
         for g in gs:
             purpose = g.purpose if len(g.purpose) <= 40 else g.purpose[:39] + "…"
-            label = f"{g.short}  {purpose}  ·  idle {ago(g.last_used)}  ·  age {ago(g.created)}"
+            label = f"{core.label(g.backend)}: {purpose}  ·  idle {ago(g.last_used)}  ·  age {ago(g.created)}"
             yield pystray.MenuItem(label, pystray.Menu(pystray.MenuItem("Revoke", revoker(g.id))))
-        yield pystray.Menu.SEPARATOR
         yield pystray.MenuItem("Revoke all", lambda: grants.revoke(), enabled=bool(gs))
-        yield pystray.MenuItem("Pause (refuse every call)", toggle_pause, checked=lambda item: grants.paused)
+        yield pystray.MenuItem("Pause (refuse every request and call)",
+                               lambda: core.set_paused(not grants.paused), checked=lambda item: grants.paused)
         yield pystray.Menu.SEPARATOR
-        yield pystray.MenuItem("Copy connector bearer token", lambda: ui.post("copy", gate.bearer))
+        for b in core.backends:
+            yield pystray.MenuItem(f"{b.label}: {b.status()}", None, enabled=False)
+            for text, action, enabled in b.actions():
+                yield pystray.MenuItem(text, action, enabled=enabled())
+        yield pystray.Menu.SEPARATOR
+        for b in core.backends:
+            for text, value in b.copies():
+                yield pystray.MenuItem(text, copier(value))
         yield pystray.MenuItem("Open audit log", lambda: os.startfile(AUDIT) if AUDIT.exists() else None)
         yield pystray.MenuItem("Open data folder", lambda: os.startfile(DATA))
         yield pystray.MenuItem("Quit", lambda: on_quit())
 
-    def toggle_pause():
-        grants.paused = not grants.paused
-        refresh()
-
-    icon = pystray.Icon("mcp-windows-gate", tray_image(IDLE), "mcp-windows gate", pystray.Menu(items))
+    icon = pystray.Icon("windows-gate", tray_image(IDLE), "Gate", pystray.Menu(items))
 
     def refresh():
         n = len(grants.snapshot())
         icon.icon = tray_image(PAUSED_C if grants.paused else LIVE if n else IDLE)
-        icon.title = f"mcp-windows gate: {'paused' if grants.paused else f'{n} live grant(s)'}"
+        icon.title = f"Gate: {'paused' if grants.paused else f'{n} live grant(s)'}"
         icon.update_menu()
 
     return icon, refresh
 
 
+# --------------------------------------------------------------------------- core
+
+class Core:
+    """What every backend shares: grants, the dialog, the job object, the loop.
+
+    A backend has `name`, `label`, `hostname`, `port`, and `run(stop)`, `shutdown()`,
+    `status()`, `actions()` -> [(text, callable, enabled())], `copies()` ->
+    [(text, value)], and optionally `grants_changed()` and `paused_changed(paused)`,
+    which may be called from any thread.
+    """
+
+    def __init__(self, args, grants, ui, job):
+        self.args, self.grants, self.ui, self.job = args, grants, ui, job
+        self.backends = []
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.refresh_tray = lambda: None
+        grants.on_change = self._grants_changed
+
+    def label(self, name):
+        return next((b.label for b in self.backends if b.name == name), name)
+
+    def call(self, coro):
+        """Run a coroutine on the gate's loop, from the Tk or tray thread."""
+        return asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+    def _grants_changed(self):
+        self.refresh_tray()
+        for b in self.backends:
+            getattr(b, "grants_changed", lambda: None)()
+
+    def set_paused(self, paused):
+        self.grants.paused = paused
+        audit(event="paused" if paused else "resumed")
+        for b in self.backends:
+            getattr(b, "paused_changed", lambda p: None)(paused)
+        self._grants_changed()
+
+    def write_tunnel_config(self):
+        lines = [f"tunnel: {self.args.tunnel}", "ingress:"]
+        for b in self.backends:
+            lines += [f"  - hostname: {b.hostname}", f"    service: http://127.0.0.1:{b.port}"]
+        lines.append("  - service: http_status:404")
+        path = DATA / "cloudflared.yml"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
+    async def run(self, stop):
+        self.loop = asyncio.get_running_loop()
+        tasks = [asyncio.ensure_future(b.run(stop)) for b in self.backends]
+        if self.args.tunnel:
+            cf = shutil.which("cloudflared") or "cloudflared"
+            tasks.append(asyncio.ensure_future(supervise("cloudflared", [
+                cf, "tunnel", "--no-autoupdate", "--config", str(self.write_tunnel_config()),
+                "run", self.args.tunnel], self.job)))
+
+        async def sweeper():
+            while True:
+                await asyncio.sleep(20)
+                self.grants.sweep()
+        tasks.append(asyncio.ensure_future(sweeper()))
+
+        await stop.wait()
+        for b in self.backends:
+            await b.shutdown()
+        for t in tasks:
+            t.cancel()
+
+
 # --------------------------------------------------------------------------- main
 
 def main():
+    # The backends `from gate import ...`; without this they would load a second
+    # copy of this file, with its own activity list.
+    sys.modules["gate"] = sys.modules[__name__]
+    import mcp_windows
+    import pinchtab_windows
+
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", type=int, default=9340)
     ap.add_argument("--tunnel", default="", help="named cloudflared tunnel to run (empty: none)")
-    ap.add_argument("--hold", type=int, default=140, help="seconds to hold a call while asking (claude.ai gives up at 180)")
-    ap.add_argument("--idle", type=int, default=15 * 60)
-    ap.add_argument("--cap", type=int, default=60 * 60)
     ap.add_argument("--no-replace", dest="replace", action="store_false",
                     help="don't terminate a previously started gate (for a side-by-side test copy)")
+    ap.add_argument("--only", choices=["mcp-windows", "pinchtab"], help="run one backend (testing)")
+    mcp_windows.add_args(ap)
+    pinchtab_windows.add_args(ap)
     args = ap.parse_args()
 
     logging.basicConfig(filename=DATA / "gate.log", level=logging.INFO,
@@ -685,47 +649,51 @@ def main():
 
     if args.replace:
         replace_previous()
-    for _ in range(50):
-        with socket.socket() as s:
-            try:
-                s.bind(("127.0.0.1", args.port))
-                break
-            except OSError:
-                time.sleep(0.1)
-    else:
-        tk.Tk().withdraw()
-        messagebox.showerror("mcp-windows gate", f"Port {args.port} is in use by something other than a previous gate.")
-        return
+    modules = [m for m in (mcp_windows, pinchtab_windows) if args.only in (None, m.NAME)]
+    for port in (m.port(args) for m in modules):
+        for _ in range(50):
+            with socket.socket() as s:
+                try:
+                    s.bind(("127.0.0.1", port))
+                    break
+                except OSError:
+                    time.sleep(0.1)
+        else:
+            tk.Tk().withdraw()
+            messagebox.showerror("Gate", f"Port {port} is in use by something other than a previous gate.")
+            return
 
-    grants = Grants(args.idle, args.cap)
-    ui = UI()
-    gate = Gate(args, grants, ui)
-    job = KillOnCloseJob()
+    core = Core(args, Grants(), UI(), KillOnCloseJob())
+    core.backends = [m.Backend(core) for m in modules]
 
     loop = asyncio.new_event_loop()
     stop = asyncio.Event()
 
     def quit_all():
-        loop.call_soon_threadsafe(stop.set)
+        def stop_soon():
+            stop.set()
+        loop.call_soon_threadsafe(stop_soon)
+        time.sleep(2)  # let the backends detach (the bridge clears its tab titles)
         icon.stop()
-        ui.post("quit")
+        core.ui.post("quit")
 
-    icon, refresh = build_tray(grants, ui, gate, quit_all)
-    grants.on_change = refresh
+    icon, core.refresh_tray = build_tray(core, quit_all)
 
     def run_loop():
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(gate.run(job, stop))
+            loop.run_until_complete(core.run(stop))
         except Exception:
             log.exception("gate crashed")
-            ui.post("quit")
+            core.ui.post("quit")
 
     threading.Thread(target=run_loop, daemon=True).start()
     threading.Thread(target=icon.run, daemon=True).start()
-    ui.root.mainloop()
+    core.ui.root.mainloop()
     loop.call_soon_threadsafe(stop.set)
 
 
 if __name__ == "__main__":
     main()
+
+
