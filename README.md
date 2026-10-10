@@ -5,7 +5,7 @@
 One approval gate on Louie's laptop for everything cloud Claude may do on it, with a backend per thing it guards:
 
 - **PC control** ([`mcp_windows.py`](mcp_windows.py)): [windows-mcp](https://github.com/CursorTouch/Windows-MCP), as claude.ai's `mcp-windows` custom connector.
-- **Chrome** ([`pinchtab_windows.py`](pinchtab_windows.py)): a [pinchtab](https://github.com/louietyj/pinchtab) bridge attached to his real Chrome, for the headless-browser skill's `pinchtab-windows` tier.
+- **Chrome** ([`pinchtab_windows.py`](pinchtab_windows.py)): a [pinchtab](https://github.com/louietyj/pinchtab) bridge attached to his real Chrome, for the web-browser skill's `pinchtab-windows` tier.
 
 [`gate.py`](gate.py) is what they share: the grants, the approval dialog, the tray icon and its window, the audit log, and the supervised children (windows-mcp, the bridge, cloudflared).
 
@@ -41,7 +41,7 @@ A leaked bearer token therefore produces a dialog Louie denies, never a silent c
 
 ## How access works (Chrome)
 
-The sandbox's `pinchtab-windows` shim (claude-skills `headless-browser/setup.sh`) sends the key from the skill's `windows.json` as `X-Gate-Key`. It drives the bridge with pinchtab's own CLI, and the grant goes as the Bearer token:
+The sandbox's `pinchtab-windows` shim (claude-skills `web-browser/setup.sh`) sends the key from the skill's `windows.json` as `X-Gate-Key`. It drives the bridge with pinchtab's own CLI, and the grant goes as the Bearer token:
 
 - `POST /grant {purpose, code, agent}` pops the dialog. The 4-character code is the one Claude has just written in the chat, so Louie can tell his own request from someone else's. `GET /grant/<id>?wait=55` long-polls, staying under Cloudflare's 100 s limit on a request and claude.ai's 300 s limit on a bash call.
 - A grant lapses after 30 min idle or 4 h. `DELETE /grant` releases it, and `/active-tab` says which tab Louie is on.
@@ -77,7 +77,7 @@ Measured against claude.ai (Cowork) on 2026-10-09:
 | Scheduled task | `mcp-windows-gate`: at logon, as Louie, interactive. A service can't show dialogs. It runs `uvw run --script C:\Users\louie\mcp-windows-gate\gate.py --tunnel mcp-windows`. |
 | Tunnel | Named tunnel `mcp-windows` (`47213dd5-…`), credentials in `~\.cloudflared\47213dd5-….json`, CNAMEs `mcp-windows.louietyj.me` and `browser.louietyj.me`. The gate writes its ingress rules to `cloudflared.yml`. |
 | Connector | claude.ai → `mcp-windows`, URL `https://mcp-windows.louietyj.me/mcp`, bearer from the tray's "Copy connector bearer token" |
-| Skill | claude-skills `headless-browser/windows.json`: `browser.louietyj.me` and the key from the tray's "Copy browser gate key", shipped in the skill zip |
+| Skill | claude-skills `web-browser/windows.json`: `browser.louietyj.me` and the key from the tray's "Copy browser gate key", shipped in the skill zip |
 | State | `%LOCALAPPDATA%\mcp-windows-gate\`: `bearer.txt`, `browser-key.txt`, `audit.jsonl` (each event tagged with its backend), `gate.pid`, `gate.log`, `windows-mcp.log`, `cloudflared.log`, and `pinchtab\` (the bridge's binaries, config and `bridge.log`) |
 
 The gate supervises windows-mcp (`uvx windows-mcp serve --transport streamable-http …`), the bridge and `cloudflared tunnel run`, restarting windows-mcp and cloudflared if they die. All of them sit in a kill-on-close job object, so they exit with the gate. Its dependencies are declared inline (PEP 723), so `uv run --script` needs no install step.

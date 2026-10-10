@@ -1,4 +1,4 @@
-"""The pinchtab backend: cloud Claude driving Louie's real Chrome (the headless-browser
+"""The pinchtab backend: cloud Claude driving Louie's real Chrome (the web-browser
 skill's pinchtab-windows tier).
 
 The sandbox asks for a grant (POST /grant, then polls GET /grant/<id>), Louie approves
