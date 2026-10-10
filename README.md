@@ -1,4 +1,6 @@
-# mcp-windows-gate
+# windows-gate
+
+(Formerly mcp-windows-gate. The local folder, the scheduled task and the data directory still carry that name.)
 
 One approval gate on Louie's laptop for everything cloud Claude may do on it, with a backend per thing it guards:
 
