@@ -84,6 +84,7 @@ The gate supervises windows-mcp (`uvx windows-mcp serve --transport streamable-h
 
 ## Operating it
 
+- **Start menu:** "Windows Gate" runs the same `uvw` command, so it starts the gate or replaces a running one.
 - **Restart:** `Stop-ScheduledTask mcp-windows-gate; Start-ScheduledTask mcp-windows-gate`. Stopping kills only the `uvw` launcher and leaves the gate running, so each new gate terminates the previous one itself. It identifies it from `gate.pid`, which stores PID plus creation time, so a recycled PID can't match.
 - **Rotate the bearer:** delete `bearer.txt`, restart, then paste the new token into the connector. For the browser key, delete `browser-key.txt`, restart, then update the skill's `windows.json` and re-upload the zip.
 - **Test copy beside the live one:** `uv run --script gate.py --port 9341 --hold 10 --no-replace --only mcp-windows`, with no `--tunnel`. The pinchtab backend's ports are fixed, so test it with the live gate stopped, or with `--only pinchtab` while the live one is down.
