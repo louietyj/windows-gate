@@ -22,6 +22,8 @@ from aiohttp import web
 from gate import audit, fingerprint, free_port, load_secret, supervise
 
 NAME = "mcp-windows"
+# PyPI 0.8.8 lacks --no-control (windows-mcp #458): pin main, before the dependabot bumps, until a newer release.
+WINDOWS_MCP_SRC = "windows-mcp @ git+https://github.com/CursorTouch/Windows-MCP@e44cfb79e4b594bec35f380c856d4c1b2e99586f"
 log = logging.getLogger("gate.mcp")
 
 
@@ -283,8 +285,9 @@ class Backend:
 
         uvx = shutil.which("uvx") or "uvx"
         child = asyncio.ensure_future(supervise("windows-mcp", [
-            uvx, "windows-mcp", "serve", "--transport", "streamable-http", "--host", "127.0.0.1",
-            "--port", str(self.inner_port), "--auth-key", self.inner_key], self.job))
+            uvx, "--from", WINDOWS_MCP_SRC, "windows-mcp", "serve", "--transport", "streamable-http",
+            "--host", "127.0.0.1", "--port", str(self.inner_port), "--auth-key", self.inner_key,
+            "--no-control"], self.job))
 
         await stop.wait()
         child.cancel()

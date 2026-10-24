@@ -68,6 +68,7 @@ Measured against claude.ai (Cowork) on 2026-10-09:
 - **Guards down.** Every windows-mcp tool is exposed, including PowerShell, Registry and FileSystem. There's no per-tool approval and no IP allowlist.
 - **claude.ai's own per-tool approval is set to "always allow".** The Windows dialog replaces it.
 - **`Snapshot` is denied in the connector, not in the gate.** It walks the UI Automation tree of every window it touches, which freezes the laptop. `region` and `display` only narrow *which* windows get walked, and each one is still walked in full (`windows_mcp/desktop/service.py` in 0.8.7). Use `Screenshot` and coordinate clicks instead, and the pinchtab path for anything in Chrome.
+- **windows-mcp runs with `--no-control`, from a git pin.** Its control gate rejects every call with `USER_CONTROL` until 10 s after the last real mouse or key event, and some wireless receivers keep resetting that (windows-mcp #498). `--no-control` (#458) isn't in PyPI 0.8.8 (#475), so `WINDOWS_MCP_SRC` pins `e44cfb7` of main; go back to a PyPI pin once a newer release ships. The cost: Claude's input no longer yields when Louie touches the mouse.
 - **Stronger binding, if ever wanted.** A sandbox-side client that generates a per-conversation signing key, registers it through the dialog, and signs every request. Connectors can't do this, since they can't run client-side code; it would mean the sandbox's `lmcps` route instead.
 
 ## Deployment on this machine
@@ -80,7 +81,7 @@ Measured against claude.ai (Cowork) on 2026-10-09:
 | Skill | claude-skills `web-browser/windows.json`: `browser.louietyj.me` and the key from the tray's "Copy browser gate key", shipped in the skill zip |
 | State | `%LOCALAPPDATA%\mcp-windows-gate\`: `bearer.txt`, `browser-key.txt`, `audit.jsonl` (each event tagged with its backend), `gate.pid`, `gate.log`, `windows-mcp.log`, `cloudflared.log`, and `pinchtab\` (the bridge's binaries, config and `bridge.log`) |
 
-The gate supervises windows-mcp (`uvx windows-mcp serve --transport streamable-http …`), the bridge and `cloudflared tunnel run`, restarting windows-mcp and cloudflared if they die. All of them sit in a kill-on-close job object, so they exit with the gate. Its dependencies are declared inline (PEP 723), so `uv run --script` needs no install step.
+The gate supervises windows-mcp (`uvx --from <git pin> windows-mcp serve --transport streamable-http … --no-control`; see `WINDOWS_MCP_SRC` in `mcp_windows.py`), the bridge and `cloudflared tunnel run`, restarting windows-mcp and cloudflared if they die. All of them sit in a kill-on-close job object, so they exit with the gate. Its dependencies are declared inline (PEP 723), so `uv run --script` needs no install step.
 
 ## Operating it
 
