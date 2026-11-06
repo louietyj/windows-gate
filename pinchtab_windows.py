@@ -195,7 +195,10 @@ class Bridge:
             # would be one of Louie's: refuse new tabs instead, and only at 500.
             "instanceDefaults": {"captureAllowActivation": True, "maxTabs": 500, "tabEvictionPolicy": "reject"},
             "security": {**{g: True for g in guards}, "allowedDomains": ["*"],
-                         "attach": {"enabled": True}, "idpi": {"enabled": False}},
+                         "attach": {"enabled": True}, "idpi": {"enabled": False},
+                         # Private addresses too: his home network, the router's admin page.
+                         "trustedResolveCIDRs": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10",
+                                                 "169.254.0.0/16", "fc00::/7", "fe80::/10"]},
             "multiInstance": {"instancePortStart": BRIDGE_PORT + 1, "instancePortEnd": BRIDGE_PORT + 21},
         }
         path = cfg_dir / "config.json"
