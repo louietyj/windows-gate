@@ -54,7 +54,7 @@ REQUEST_DEF = {
     "description": (
         "Call this before using any other tool on this server. It asks Louie to approve "
         "on his laptop and returns a grant ID that every other tool requires as `_grant`. "
-        "One grant covers the whole task: reuse it until a call says it has lapsed "
+        "One grant covers the whole conversation: reuse it until a call says it has lapsed "
         "(15 min without a call, or 1 h total)."
     ),
     "inputSchema": {
@@ -69,7 +69,12 @@ REQUEST_DEF = {
 RELEASE_DEF = {
     "name": RELEASE_TOOL,
     "title": "Release grant",
-    "description": "End this conversation's grant once the task is done, so it can't be used again.",
+    "description": (
+        "End this conversation's grant. Call it only when the conversation is clearly over: "
+        "Louie has said he's done, or nothing is left open. Finishing the task you were "
+        "asked to do isn't the end. If there's any chance he'll want more, keep the grant. "
+        "It lapses on its own after 15 idle minutes, and he can revoke it with one click."
+    ),
     "inputSchema": {"type": "object", "properties": {"_grant": GRANT_PROP}, "required": ["_grant"]},
 }
 
@@ -135,8 +140,9 @@ def rpc_result(rpc_id, text, is_error=False):
 GRANTED = (
     "Louie approved. Grant: {gid}\n"
     "Pass \"_grant\": \"{gid}\" in the arguments of every call to this server's tools for "
-    "the rest of this task. It lapses after {idle} min without a call or {cap} min total. "
-    "Call ReleaseGrant with it when the task is done."
+    "the rest of this conversation. It lapses after {idle} min without a call or {cap} min total. "
+    "Keep it while you're still talking with Louie, even when the task is done: call "
+    "ReleaseGrant only once the conversation is clearly over."
 )
 NO_GRANT = (
     "No valid grant ({why}), so this call did not run. Call RequestGrant with a one-line "
