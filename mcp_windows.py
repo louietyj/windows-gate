@@ -70,10 +70,9 @@ RELEASE_DEF = {
     "name": RELEASE_TOOL,
     "title": "Release grant",
     "description": (
-        "End this conversation's grant. Call it only when the conversation is clearly over: "
-        "Louie has said he's done, or nothing is left open. Finishing the task you were "
-        "asked to do isn't the end. If there's any chance he'll want more, keep the grant. "
-        "It lapses on its own after 15 idle minutes, and he can revoke it with one click."
+        "End this conversation's grant. Finishing your task is not the end: call this only "
+        "once Louie has clearly wrapped up, and keep the grant if he might want more. "
+        "It lapses on its own when idle, and he can revoke it in one click."
     ),
     "inputSchema": {"type": "object", "properties": {"_grant": GRANT_PROP}, "required": ["_grant"]},
 }
