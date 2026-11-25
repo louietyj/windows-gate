@@ -25,6 +25,9 @@ NAME = "mcp-windows"
 # PyPI 0.8.8 lacks --no-control (windows-mcp #458): pin main, before the dependabot bumps, until a newer release.
 WINDOWS_MCP_SRC = "windows-mcp @ git+https://github.com/CursorTouch/Windows-MCP@e44cfb79e4b594bec35f380c856d4c1b2e99586f"
 log = logging.getLogger("gate.mcp")
+SLOW_S = 3
+# Everything but tools/call should answer at once; without a cap, a stuck one holds a pooled connection forever.
+PASSTHROUGH_TIMEOUT_S = 30
 
 
 def add_args(ap):
@@ -166,6 +169,7 @@ class Backend:
         self.inner_key = secrets.token_urlsafe(32)
         self.inner_port = free_port()
         self.http: aiohttp.ClientSession | None = None
+        self.inflight = 0
 
     def status(self):
         return f"windows-mcp behind {self.hostname}"
@@ -183,18 +187,36 @@ class Backend:
     def upstream_url(self):
         return f"http://127.0.0.1:{self.inner_port}/mcp"
 
-    async def forward(self, request, body):
+    async def forward(self, request, body, timeout=None):
         headers = {k: v for k, v in request.headers.items() if k.lower() in (
             "content-type", "accept", "mcp-protocol-version", "mcp-method", "mcp-name",
             "mcp-session-id", "last-event-id")}
         headers["Authorization"] = f"Bearer {self.inner_key}"
+        what = request.headers.get("Mcp-Method", "?")
+        if request.headers.get("Mcp-Name"):
+            what += " " + request.headers["Mcp-Name"]
+        kw = {"timeout": aiohttp.ClientTimeout(total=timeout, sock_connect=5)} if timeout else {}
+        self.inflight += 1
+        t0 = time.monotonic()
+        outcome = "?"
         try:
-            async with self.http.post(self.upstream_url, data=body, headers=headers) as r:
-                return Upstream(r.status, r.headers.get("Content-Type", "application/json"),
-                                await r.read(), r.headers.get("Mcp-Session-Id"))
-        except aiohttp.ClientError as e:
-            log.error("upstream: %s", e)
+            async with self.http.post(self.upstream_url, data=body, headers=headers, **kw) as r:
+                up = Upstream(r.status, r.headers.get("Content-Type", "application/json"),
+                              await r.read(), r.headers.get("Mcp-Session-Id"))
+                outcome = str(r.status)
+                return up
+        except asyncio.TimeoutError:
+            outcome = "timed out"
             return None
+        except aiohttp.ClientError as e:
+            outcome = f"error: {e}"
+            return None
+        finally:
+            self.inflight -= 1
+            dt = time.monotonic() - t0
+            if dt > SLOW_S or not outcome.isdigit():
+                log.warning("upstream %s: %s after %.1f s (%d other requests in flight)",
+                            what, outcome, dt, self.inflight)
 
     @staticmethod
     def respond(up):
@@ -223,7 +245,7 @@ class Backend:
         if isinstance(msg, dict) and msg.get("method") == "tools/call":
             return await self.handle_call(request, msg, ip)
 
-        up = await self.forward(request, body)
+        up = await self.forward(request, body, timeout=PASSTHROUGH_TIMEOUT_S)
         if up is None:
             return web.Response(status=502, text="windows-mcp is not reachable")
         if isinstance(msg, dict) and msg.get("method") == "tools/list":

@@ -90,7 +90,7 @@ The gate supervises windows-mcp (`uvx --from <git pin> windows-mcp serve --trans
 - **Rotate the bearer:** delete `bearer.txt`, restart, then paste the new token into the connector. For the browser key, delete `browser-key.txt`, restart, then update the skill's `windows.json` and re-upload the zip.
 - **Test copy beside the live one:** `uv run --script gate.py --port 9341 --hold 10 --no-replace --only mcp-windows`, with no `--tunnel`. The pinchtab backend's ports are fixed, so test it with the live gate stopped, or with `--only pinchtab` while the live one is down.
 - **Hand-probe:** POST to `/mcp` with `Authorization: Bearer …`, `Accept: application/json, text/event-stream`, `Mcp-Protocol-Version: 2026-07-28`, `Mcp-Method` (and `Mcp-Name` for calls), and `params._meta` carrying `io.modelcontextprotocol/protocolVersion`, `clientInfo` and `clientCapabilities`. A no-grant call should come back at once with "No valid grant".
-- **Debug:** `audit.jsonl` shows each call and its decision. A request handler that throws lands in `gate.log` as aiohttp's "Error handling request", while the client sees a 500.
+- **Debug:** `audit.jsonl` shows each call and its decision. A request handler that throws lands in `gate.log` as aiohttp's "Error handling request", while the client sees a 500. A forward to windows-mcp that fails, times out (30 s, all but `tools/call`) or takes over 3 s logs a WARNING with its method and the number of requests in flight.
 
 ## Gotchas
 
